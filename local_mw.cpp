@@ -713,8 +713,16 @@ int main(int argc, char* argv[]) {
             std::cout << "Version: " << VERSION << "\n";
             std::cout << "Source: " << SOURCE_URL << "\n";
             return 0;
-        } else if (mwPath.empty() && arg[0] != '-') {
+        } else if (arg[0] == '-') {
+            std::cerr << "Error: Unknown option '" << arg << "'\n";
+            std::cerr << "Use --help for usage information.\n";
+            return 1;
+        } else if (mwPath.empty()) {
             mwPath = arg;
+        } else {
+            std::cerr << "Error: Unexpected argument '" << arg << "'\n";
+            std::cerr << "MediaWiki path already specified as: " << mwPath << "\n";
+            return 1;
         }
     }
     

@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Run make
+      run: |
+        echo "Building the project ..."
+        make
+        echo -e "\nRunning ./bin/local_mw --help :"
+        ./bin/local_mw --help
+        echo -e "\nRunning ./bin/local_mw --fox :"
+        ./bin/local_mw --fox
+    - name: Verify version in output
+      run: |
+        VERSION=$(grep 'const std::string VERSION' local_mw.cpp | sed 's/.*"\(.*\)".*/\1/')
+        echo "Expected version: $VERSION"
+        VERSION_OUTPUT=$(./bin/local_mw --version 2>&1)
+        if echo "$VERSION_OUTPUT" | grep -q "Version: $VERSION"; then
+          echo "Version check passed: Version $VERSION found in version output"
+        else
+          echo "Version check failed: Version $VERSION not found in version output"
+          echo "Version output:"
+          echo "$VERSION_OUTPUT"
+          exit 1
+        fi
