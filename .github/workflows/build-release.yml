@@ -1,0 +1,67 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos-x86_64
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Build project
+      run: make
+
+    - name: Create release archive
+      run: |
+        VERSION=$(git describe --tags 2>/dev/null || echo "dev-unknown")
+        echo "Creating release archive for version: $VERSION"
+        mkdir -p release
+        tar -czf release/local_mw-${VERSION}-${{ matrix.platform }}.tar.gz bin/local_mw README.md
+        cp bin/local_mw release/local_mw-${VERSION}-${{ matrix.platform }}
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release/local_mw-*-${{ matrix.platform }}.tar.gz
+          release/local_mw-*-${{ matrix.platform }}
+        body: |
+          Release ${{ github.ref_name }}
+          
+          ## Installation
+          Download the binary for your platform and make it executable:
+          
+          **Linux:**
+          ```bash
+          chmod +x local_mw-*-linux-x86_64
+          sudo mv local_mw-*-linux-x86_64 /usr/local/bin/local_mw
+          ```
+          
+          **macOS:**
+          ```bash
+          chmod +x local_mw-*-macos-x86_64
+          sudo mv local_mw-*-macos-x86_64 /usr/local/bin/local_mw
+          ```
+          
+          Or extract the tar.gz and run `make install`.
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
