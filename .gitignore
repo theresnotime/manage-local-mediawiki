@@ -1,0 +1,7 @@
+# Some test things
+test-mw/
+test-not-mw/
+# Build output
+bin/
+# Reports
+report.txt
