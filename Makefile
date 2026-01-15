@@ -5,6 +5,10 @@ SRC = local_mw.cpp
 PREFIX = $(HOME)/.local
 BINDIR = $(PREFIX)/bin
 
+# Version from git tags with fallback
+VERSION ?= $(shell git describe --tags 2>/dev/null || echo "dev-unknown")
+CXXFLAGS += -DAPP_VERSION="\"$(VERSION)\""
+
 all: $(TARGET)
 
 $(TARGET): $(SRC)

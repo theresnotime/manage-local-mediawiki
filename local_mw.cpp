@@ -14,7 +14,11 @@
 
 namespace fs = std::filesystem;
 
-const std::string VERSION = "1.0.0";
+// Version is injected at compile time via -DAPP_VERSION
+#ifndef APP_VERSION
+#define APP_VERSION "dev-unknown"
+#endif
+const std::string VERSION = APP_VERSION;
 const std::string SOURCE_URL = "https://github.com/theresnotime/manage-local-mediawiki";
 
 bool g_verbose = false;
