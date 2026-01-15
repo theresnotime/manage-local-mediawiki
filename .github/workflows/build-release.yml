@@ -37,7 +37,7 @@ jobs:
         cp bin/local_mw release/local_mw-${VERSION}-${{ matrix.platform }}
 
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           release/local_mw-*-${{ matrix.platform }}.tar.gz
