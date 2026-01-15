@@ -26,7 +26,7 @@ jobs:
 
     - name: Verify version in output
       run: |
-        VERSION=$(grep 'const std::string VERSION' local_mw.cpp | sed 's/.*"\(.*\)".*/\1/')
+        VERSION=$(git describe --tags 2>/dev/null || echo "dev-unknown")
         echo "Expected version: $VERSION"
         VERSION_OUTPUT=$(./bin/local_mw --version 2>&1)
         if echo "$VERSION_OUTPUT" | grep -q "Version: $VERSION"; then
