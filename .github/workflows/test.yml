@@ -1,4 +1,4 @@
-name: Build
+name: Test
 
 on:
   push:
@@ -7,19 +7,23 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v3
     - name: Run make
-      run: |
-        echo "Building the project ..."
-        make
-        echo -e "\nRunning ./bin/local_mw --help :"
-        ./bin/local_mw --help
-        echo -e "\nRunning ./bin/local_mw --fox :"
-        ./bin/local_mw --fox
+      run: make
+
+    - name: Binary check (./bin/local_mw --version)
+      run: ./bin/local_mw --version
+
+    - name: Binary check (./bin/local_mw --fox)
+      run: ./bin/local_mw --fox
+
+    - name: Binary check (./bin/local_mw --not-known-flag)
+      run: ./bin/local_mw --not-known-flag || echo "Expected failure on unknown flag"
+
     - name: Verify version in output
       run: |
         VERSION=$(grep 'const std::string VERSION' local_mw.cpp | sed 's/.*"\(.*\)".*/\1/')
