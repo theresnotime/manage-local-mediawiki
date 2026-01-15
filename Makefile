@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -pthread
 TARGET = local_mw
 SRC = local_mw.cpp
 PREFIX = $(HOME)/.local
