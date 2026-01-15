@@ -12,6 +12,18 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Run clang-format
+      run: |
+        pipx install clang-format
+        clang-format --version
+        clang-format --Werror --dry-run local_mw.cpp
+
     - name: Run make
       run: make
 
