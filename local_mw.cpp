@@ -1,4 +1,5 @@
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -10,7 +11,13 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+#include <csignal>
+#include <sys/wait.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -29,7 +36,15 @@ bool g_updateMode = false;
 std::string g_updateType;
 std::string g_updateName;
 std::string g_reportFile;
+int g_commandTimeoutSeconds = 30;
+int g_pullTimeoutSeconds = 120;
+int g_gerritDelaySeconds = 1;
 std::mutex g_coutMutex;
+std::mutex g_gerritRateLimitMutex;
+std::mutex g_gerritCacheMutex;
+std::chrono::steady_clock::time_point g_lastGerritInteraction =
+    std::chrono::steady_clock::time_point::min();
+std::unordered_map<std::string, bool> g_gerritRepoCache;
 
 /**
  * Log a verbose message (thread-safe)
@@ -88,6 +103,21 @@ struct RepoStatus {
   std::string pullError;
 };
 
+// Forward declarations for timeout-aware command and git helpers.
+std::string execCommand(const std::string &cmd, int timeoutSeconds,
+                        bool *timedOut, int *exitCode);
+std::string getCurrentBranch(const fs::path &repoPath, bool &timedOut);
+bool fetchUpdates(const fs::path &repoPath, std::string &errorMsg,
+                  bool &timedOut);
+int checkBehindCommits(const fs::path &repoPath, const std::string &branch,
+                       bool &timedOut);
+bool hasUncommittedChanges(const fs::path &repoPath, bool &timedOut);
+bool performGitPull(const fs::path &repoPath, std::string &errorMsg,
+                    bool &timedOut);
+bool isGerritRepo(const fs::path &repoPath);
+void throttleGerritInteraction(const fs::path &repoPath,
+                               const std::string &operation);
+
 /**
  * Execute a command and capture its output
  *
@@ -95,12 +125,83 @@ struct RepoStatus {
  * @return The command output as a string
  */
 std::string execCommand(const std::string &cmd) {
-  if (g_verbose) {
-    logVerbose("  [CMD] " + cmd);
+  return execCommand(cmd, 0, nullptr, nullptr);
+}
+
+/**
+ * Escape a string for safe use as a single shell argument.
+ *
+ * @param value Input value
+ * @return Shell-escaped value wrapped in single quotes
+ */
+std::string shellEscape(const std::string &value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('\'');
+  for (char c : value) {
+    if (c == '\'') {
+      escaped += "'\"'\"'";
+    } else {
+      escaped.push_back(c);
+    }
   }
+  escaped.push_back('\'');
+  return escaped;
+}
+
+/**
+ * Build a command string that enforces a timeout using perl alarm.
+ *
+ * @param cmd The command to execute
+ * @param timeoutSeconds Timeout in seconds; <= 0 means no timeout
+ * @return Wrapped command string
+ */
+std::string buildTimedCommand(const std::string &cmd, int timeoutSeconds) {
+  if (timeoutSeconds <= 0) {
+    return cmd;
+  }
+
+#ifdef _WIN32
+  return cmd;
+#else
+  std::ostringstream oss;
+  oss << "perl -e 'alarm shift; exec @ARGV' " << timeoutSeconds
+      << " /bin/sh -c " << shellEscape(cmd);
+  return oss.str();
+#endif
+}
+
+/**
+ * Execute a command, optionally with timeout and status metadata.
+ *
+ * @param cmd The command to execute
+ * @param timeoutSeconds Timeout in seconds; <= 0 means no timeout
+ * @param timedOut Optional output flag set true when timeout occurs
+ * @param exitCode Optional output command exit code
+ * @return The command output as a string
+ */
+std::string execCommand(const std::string &cmd, int timeoutSeconds,
+                        bool *timedOut, int *exitCode) {
+  if (g_verbose) {
+    std::ostringstream oss;
+    oss << "  [CMD] " << cmd;
+    if (timeoutSeconds > 0) {
+      oss << " (timeout=" << timeoutSeconds << "s)";
+    }
+    logVerbose(oss.str());
+  }
+
+  if (timedOut) {
+    *timedOut = false;
+  }
+  if (exitCode) {
+    *exitCode = -1;
+  }
+
+  std::string finalCommand = buildTimedCommand(cmd, timeoutSeconds);
   std::array<char, 128> buffer;
   std::string result;
-  FILE *pipe = popen(cmd.c_str(), "r");
+  FILE *pipe = popen(finalCommand.c_str(), "r");
   if (!pipe) {
     if (g_verbose) {
       logVerbose("  [ERROR] Failed to execute command");
@@ -110,7 +211,48 @@ std::string execCommand(const std::string &cmd) {
   while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
     result += buffer.data();
   }
-  pclose(pipe);
+  int status = pclose(pipe);
+
+  bool didTimeout = false;
+  int code = -1;
+
+#ifndef _WIN32
+  if (status != -1) {
+    if (WIFEXITED(status)) {
+      code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+      int sig = WTERMSIG(status);
+      code = 128 + sig;
+      if (sig == SIGALRM) {
+        didTimeout = true;
+      }
+    }
+  }
+#else
+  code = status;
+#endif
+
+  // perl alarm timeout commonly propagates as exit code 142
+  if (code == 142) {
+    didTimeout = true;
+  }
+
+  if (timedOut) {
+    *timedOut = didTimeout;
+  }
+  if (exitCode) {
+    *exitCode = code;
+  }
+
+  if (didTimeout) {
+    std::ostringstream timeoutMsg;
+    timeoutMsg << "[TIMEOUT] Command exceeded " << timeoutSeconds << "s";
+    if (!result.empty() && result.back() != '\n') {
+      result.push_back('\n');
+    }
+    result += timeoutMsg.str() + "\n";
+  }
+
   if (g_verbose && !result.empty()) {
     if (result.back() != '\n') {
       result.push_back('\n');
@@ -151,15 +293,95 @@ bool isMediaWikiDirectory(const fs::path &path) {
 bool isGitRepo(const fs::path &path) { return fs::exists(path / ".git"); }
 
 /**
+ * Check whether repository origin appears to be a Gerrit remote.
+ *
+ * @param repoPath The repository path
+ * @return true if origin URL contains "gerrit", false otherwise
+ */
+bool isGerritRepo(const fs::path &repoPath) {
+  const std::string key = repoPath.string();
+  {
+    std::lock_guard<std::mutex> lock(g_gerritCacheMutex);
+    auto it = g_gerritRepoCache.find(key);
+    if (it != g_gerritRepoCache.end()) {
+      return it->second;
+    }
+  }
+
+  std::string cmd = "cd \"" + repoPath.string() +
+                    "\" && git remote get-url origin 2>/dev/null";
+  std::string remoteUrl =
+      execCommand(cmd, g_commandTimeoutSeconds, nullptr, nullptr);
+  bool isGerrit = remoteUrl.find("gerrit") != std::string::npos;
+
+  {
+    std::lock_guard<std::mutex> lock(g_gerritCacheMutex);
+    g_gerritRepoCache[key] = isGerrit;
+  }
+
+  return isGerrit;
+}
+
+/**
+ * Throttle Gerrit interactions across all worker threads.
+ *
+ * @param repoPath The repository path
+ * @param operation Operation name for verbose logs
+ */
+void throttleGerritInteraction(const fs::path &repoPath,
+                               const std::string &operation) {
+  if (g_gerritDelaySeconds <= 0 || !isGerritRepo(repoPath)) {
+    return;
+  }
+
+  const auto delay = std::chrono::seconds(g_gerritDelaySeconds);
+  std::unique_lock<std::mutex> lock(g_gerritRateLimitMutex);
+  if (g_lastGerritInteraction != std::chrono::steady_clock::time_point::min()) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = now - g_lastGerritInteraction;
+    if (elapsed < delay) {
+      auto waitTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+          delay - elapsed);
+      if (g_verbose) {
+        logVerbose("  [RATE LIMIT] Waiting " +
+                   std::to_string(waitTime.count()) + "ms before Gerrit " +
+                   operation);
+      }
+      std::this_thread::sleep_for(delay - elapsed);
+    }
+  }
+  g_lastGerritInteraction = std::chrono::steady_clock::now();
+}
+
+/**
  * Get the current branch name
  *
  * @param repoPath The repository path
  * @return The current branch name, or empty string on error
  */
 std::string getCurrentBranch(const fs::path &repoPath) {
+  bool timedOut = false;
+  return getCurrentBranch(repoPath, timedOut);
+}
+
+/**
+ * Get the current branch name
+ *
+ * @param repoPath The repository path
+ * @param timedOut Output flag indicating timeout
+ * @return The current branch name, or empty string on error
+ */
+std::string getCurrentBranch(const fs::path &repoPath, bool &timedOut) {
   std::string cmd = "cd \"" + repoPath.string() +
                     "\" && git rev-parse --abbrev-ref HEAD 2>/dev/null";
-  std::string branch = execCommand(cmd);
+  int exitCode = 0;
+  std::string branch =
+      execCommand(cmd, g_commandTimeoutSeconds, &timedOut, &exitCode);
+
+  if (timedOut || exitCode != 0) {
+    return "";
+  }
+
   // Remove trailing newline
   if (!branch.empty() && branch.back() == '\n') {
     branch.pop_back();
@@ -175,10 +397,40 @@ std::string getCurrentBranch(const fs::path &repoPath) {
  * detected
  */
 bool fetchUpdates(const fs::path &repoPath) {
+  std::string errorMsg;
+  bool timedOut = false;
+  return fetchUpdates(repoPath, errorMsg, timedOut);
+}
+
+/**
+ * Fetch updates from remote
+ *
+ * @param repoPath The repository path
+ * @param errorMsg Detailed error or timeout message
+ * @param timedOut Output flag indicating timeout
+ * @return true if fetch succeeded, false otherwise
+ */
+bool fetchUpdates(const fs::path &repoPath, std::string &errorMsg,
+                  bool &timedOut) {
+  throttleGerritInteraction(repoPath, "fetch");
   std::string cmd = "cd \"" + repoPath.string() + "\" && git fetch 2>&1";
-  std::string output = execCommand(cmd);
-  return output.find("error") == std::string::npos &&
-         output.find("fatal") == std::string::npos;
+  int exitCode = 0;
+  std::string output =
+      execCommand(cmd, g_commandTimeoutSeconds, &timedOut, &exitCode);
+
+  if (timedOut) {
+    errorMsg = "git fetch timed out after " +
+               std::to_string(g_commandTimeoutSeconds) + "s";
+    return false;
+  }
+
+  if (exitCode != 0 || output.find("error") != std::string::npos ||
+      output.find("fatal") != std::string::npos) {
+    errorMsg = output.empty() ? "git fetch failed" : output;
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -189,12 +441,28 @@ bool fetchUpdates(const fs::path &repoPath) {
  * @return Number of commits behind, or -1 on error
  */
 int checkBehindCommits(const fs::path &repoPath, const std::string &branch) {
+  bool timedOut = false;
+  return checkBehindCommits(repoPath, branch, timedOut);
+}
+
+/**
+ * Check if local branch is behind remote
+ *
+ * @param repoPath The repository path
+ * @param branch The branch name to check
+ * @param timedOut Output flag indicating timeout
+ * @return Number of commits behind, or -1 on error
+ */
+int checkBehindCommits(const fs::path &repoPath, const std::string &branch,
+                       bool &timedOut) {
   std::string cmd = "cd \"" + repoPath.string() +
                     "\" && git rev-list --count HEAD..origin/" + branch +
                     " 2>/dev/null";
-  std::string result = execCommand(cmd);
+  int exitCode = 0;
+  std::string result =
+      execCommand(cmd, g_commandTimeoutSeconds, &timedOut, &exitCode);
 
-  if (result.empty()) {
+  if (timedOut || exitCode != 0 || result.empty()) {
     return -1; // Error or no tracking branch
   }
 
@@ -212,9 +480,26 @@ int checkBehindCommits(const fs::path &repoPath, const std::string &branch) {
  * @return true if there are uncommitted changes, false otherwise
  */
 bool hasUncommittedChanges(const fs::path &repoPath) {
+  bool timedOut = false;
+  return hasUncommittedChanges(repoPath, timedOut);
+}
+
+/**
+ * Check if repository has uncommitted changes
+ *
+ * @param repoPath The repository path
+ * @param timedOut Output flag indicating timeout
+ * @return true if there are uncommitted changes, false otherwise
+ */
+bool hasUncommittedChanges(const fs::path &repoPath, bool &timedOut) {
   std::string cmd =
       "cd \"" + repoPath.string() + "\" && git status --porcelain 2>/dev/null";
-  std::string result = execCommand(cmd);
+  int exitCode = 0;
+  std::string result =
+      execCommand(cmd, g_commandTimeoutSeconds, &timedOut, &exitCode);
+  if (timedOut || exitCode != 0) {
+    return false;
+  }
   return !result.empty();
 }
 
@@ -228,12 +513,36 @@ bool hasUncommittedChanges(const fs::path &repoPath) {
  * detected.
  */
 bool performGitPull(const fs::path &repoPath, std::string &errorMsg) {
-  std::string cmd = "cd \"" + repoPath.string() + "\" && git pull 2>&1";
-  std::string output = execCommand(cmd);
+  bool timedOut = false;
+  return performGitPull(repoPath, errorMsg, timedOut);
+}
 
-  if (output.find("error") != std::string::npos ||
+/**
+ * Performs a git pull operation on the specified repository.
+ *
+ * @param repoPath The filesystem path to the git repository.
+ * @param errorMsg Reference to a string that will contain error output if the
+ * operation fails.
+ * @param timedOut Output flag indicating timeout
+ * @return true if git pull succeeded, false otherwise.
+ */
+bool performGitPull(const fs::path &repoPath, std::string &errorMsg,
+                    bool &timedOut) {
+  throttleGerritInteraction(repoPath, "pull");
+  std::string cmd = "cd \"" + repoPath.string() + "\" && git pull 2>&1";
+  int exitCode = 0;
+  std::string output =
+      execCommand(cmd, g_pullTimeoutSeconds, &timedOut, &exitCode);
+
+  if (timedOut) {
+    errorMsg = "git pull timed out after " +
+               std::to_string(g_pullTimeoutSeconds) + "s";
+    return false;
+  }
+
+  if (exitCode != 0 || output.find("error") != std::string::npos ||
       output.find("fatal") != std::string::npos) {
-    errorMsg = output;
+    errorMsg = output.empty() ? "git pull failed" : output;
     return false;
   }
 
@@ -277,11 +586,13 @@ RepoStatus checkRepository(const fs::path &repoPath, const std::string &type) {
   if (g_verbose) {
     logVerbose("  [STEP] Getting current branch...");
   }
-  status.currentBranch = getCurrentBranch(repoPath);
+  bool branchTimedOut = false;
+  status.currentBranch = getCurrentBranch(repoPath, branchTimedOut);
   if (status.currentBranch.empty()) {
-    status.error = "Could not determine branch";
+    status.error = branchTimedOut ? "Timed out determining branch"
+                                  : "Could not determine branch";
     if (g_verbose) {
-      logVerbose("  [ERROR] Could not determine branch");
+      logVerbose("  [ERROR] " + status.error);
     }
     return status;
   }
@@ -293,10 +604,15 @@ RepoStatus checkRepository(const fs::path &repoPath, const std::string &type) {
   if (g_verbose) {
     logVerbose("  [STEP] Fetching updates from remote...");
   }
-  if (!fetchUpdates(repoPath)) {
-    status.error = "Failed to fetch updates";
+  bool fetchTimedOut = false;
+  std::string fetchError;
+  if (!fetchUpdates(repoPath, fetchError, fetchTimedOut)) {
+    status.error = fetchTimedOut ? fetchError : "Failed to fetch updates";
+    if (!fetchError.empty() && !fetchTimedOut) {
+      status.error += ": " + fetchError;
+    }
     if (g_verbose) {
-      logVerbose("  [ERROR] Failed to fetch updates");
+      logVerbose("  [ERROR] " + status.error);
     }
     return status;
   }
@@ -305,13 +621,31 @@ RepoStatus checkRepository(const fs::path &repoPath, const std::string &type) {
   if (g_verbose) {
     logVerbose("  [STEP] Checking commits behind remote...");
   }
-  status.behindBy = checkBehindCommits(repoPath, status.currentBranch);
+  bool behindTimedOut = false;
+  status.behindBy =
+      checkBehindCommits(repoPath, status.currentBranch, behindTimedOut);
+  if (behindTimedOut) {
+    status.error = "Timed out checking commits behind remote";
+    if (g_verbose) {
+      logVerbose("  [ERROR] " + status.error);
+    }
+    return status;
+  }
 
   // Check for uncommitted changes on all repos
   if (g_verbose) {
     logVerbose("  [STEP] Checking for uncommitted changes...");
   }
-  status.hadUncommittedChanges = hasUncommittedChanges(repoPath);
+  bool uncommittedTimedOut = false;
+  status.hadUncommittedChanges =
+      hasUncommittedChanges(repoPath, uncommittedTimedOut);
+  if (uncommittedTimedOut) {
+    status.error = "Timed out checking uncommitted changes";
+    if (g_verbose) {
+      logVerbose("  [ERROR] " + status.error);
+    }
+    return status;
+  }
   if (status.hadUncommittedChanges && g_verbose) {
     logVerbose("  [WARNING] Repository has uncommitted changes!");
   }
@@ -348,12 +682,17 @@ RepoStatus checkRepository(const fs::path &repoPath, const std::string &type) {
         if (g_verbose) {
           logVerbose("  [STEP] Performing git pull...");
         }
-        if (performGitPull(repoPath, status.pullError)) {
+        bool pullTimedOut = false;
+        if (performGitPull(repoPath, status.pullError, pullTimedOut)) {
           status.pulled = true;
           if (g_verbose) {
             logVerbose("  [SUCCESS] Git pull completed");
           }
         } else {
+          if (pullTimedOut) {
+            status.pullError = "git pull timed out after " +
+                               std::to_string(g_pullTimeoutSeconds) + "s";
+          }
           if (g_verbose) {
             logVerbose("  [ERROR] Git pull failed: " + status.pullError);
           }
@@ -691,6 +1030,55 @@ int main(int argc, char *argv[]) {
       }
       g_reportFile = argv[++i];
       std::cout << "Report will be saved to: " << g_reportFile << "\n";
+    } else if (arg == "--timeout") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --timeout requires SECONDS argument\n";
+        return 1;
+      }
+      try {
+        g_commandTimeoutSeconds = std::stoi(argv[++i]);
+      } catch (...) {
+        std::cerr << "Error: Invalid timeout value\n";
+        return 1;
+      }
+      if (g_commandTimeoutSeconds < 1) {
+        std::cerr << "Error: --timeout must be >= 1\n";
+        return 1;
+      }
+      std::cout << "Command timeout set to: " << g_commandTimeoutSeconds
+                << "s\n";
+    } else if (arg == "--pull-timeout") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --pull-timeout requires SECONDS argument\n";
+        return 1;
+      }
+      try {
+        g_pullTimeoutSeconds = std::stoi(argv[++i]);
+      } catch (...) {
+        std::cerr << "Error: Invalid pull-timeout value\n";
+        return 1;
+      }
+      if (g_pullTimeoutSeconds < 1) {
+        std::cerr << "Error: --pull-timeout must be >= 1\n";
+        return 1;
+      }
+      std::cout << "Pull timeout set to: " << g_pullTimeoutSeconds << "s\n";
+    } else if (arg == "--gerrit-delay") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --gerrit-delay requires SECONDS argument\n";
+        return 1;
+      }
+      try {
+        g_gerritDelaySeconds = std::stoi(argv[++i]);
+      } catch (...) {
+        std::cerr << "Error: Invalid gerrit-delay value\n";
+        return 1;
+      }
+      if (g_gerritDelaySeconds < 0) {
+        std::cerr << "Error: --gerrit-delay must be >= 0\n";
+        return 1;
+      }
+      std::cout << "Gerrit delay set to: " << g_gerritDelaySeconds << "s\n";
     } else if (arg == "--update") {
       if (i + 1 >= argc) {
         std::cerr << "Error: --update requires TYPE argument\n";
@@ -723,6 +1111,13 @@ int main(int argc, char *argv[]) {
           << "  --report-only      Only report status, don't pull updates\n";
       std::cout << "  -y, --yes          Auto-confirm all pull prompts\n";
       std::cout << "  --report-file FILE Save results and summary to a file\n";
+      std::cout << "  --timeout SEC      Timeout for git checks/fetch in "
+                   "seconds\n";
+      std::cout << "                     (default: 30)\n";
+      std::cout << "  --pull-timeout SEC Timeout for git pull in seconds\n";
+      std::cout << "                     (default: 120)\n";
+      std::cout << "  --gerrit-delay SEC Delay between Gerrit interactions\n";
+      std::cout << "                     (default: 1, 0 disables)\n";
       std::cout << "  --update TYPE NAME Update a specific extension or skin\n";
       std::cout << "                     TYPE must be 'core', 'extension', or "
                    "'skin'\n";
